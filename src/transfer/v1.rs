@@ -7,14 +7,14 @@ use super::*;
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 #[serde(rename_all = "kebab-case")]
-pub enum Offer {
+pub enum OfferMessage {
     Message(String),
     File {
-        filename: PathBuf,
+        filename: String,
         filesize: u64,
     },
     Directory {
-        dirname: PathBuf,
+        dirname: String,
         mode: String,
         zipsize: u64,
         numbytes: u64,
@@ -26,7 +26,7 @@ pub enum Offer {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "snake_case")]
-pub enum Answer {
+pub enum AnswerMessage {
     MessageAck(String),
     FileAck(String),
 }
@@ -66,11 +66,22 @@ impl TransitAck {
     }
 }
 
-pub async fn send_file<F, N, G, H>(
+pub async fn send(
+    mut wormhole: Wormhole,
+    relay_hints: Vec<transit::RelayHint>,
+    offer: OfferSend,
+    progress_handler: impl FnMut(u64, u64) + 'static,
+    peer_version: AppVersion,
+) -> Result<(), TransferError>
+{
+    todo!()
+}
+
+pub async fn send_file<F, G, H>(
     mut wormhole: Wormhole,
     relay_hints: Vec<transit::RelayHint>,
     file: &mut F,
-    file_name: N,
+    file_name: impl Into<String>,
     file_size: u64,
     transit_abilities: transit::Abilities,
     transit_handler: G,
@@ -79,7 +90,6 @@ pub async fn send_file<F, N, G, H>(
 ) -> Result<(), TransferError>
 where
     F: AsyncRead + Unpin,
-    N: Into<PathBuf>,
     G: FnOnce(transit::TransitInfo, std::net::SocketAddr),
     H: FnMut(u64, u64) + 'static,
 {
@@ -89,7 +99,7 @@ where
         // We want to do some transit
         debug!("Sending transit message '{:?}", connector.our_hints());
         wormhole
-            .send_json(&PeerMessage::transit(
+            .send_json(&PeerMessage::transit_v1(
                 *connector.our_abilities(),
                 (**connector.our_hints()).clone(),
             ))
@@ -98,7 +108,7 @@ where
         // Send file offer message.
         debug!("Sending file offer");
         wormhole
-            .send_json(&PeerMessage::offer_file(file_name, file_size))
+            .send_json(&PeerMessage::offer_file_v1(file_name, file_size))
             .await?;
 
         // Wait for their transit response
@@ -119,7 +129,7 @@ where
             debug!("Received file ack message: {:?}", fileack_msg);
 
             match fileack_msg.check_err()? {
-                PeerMessage::Answer(Answer::FileAck(msg)) => {
+                PeerMessage::Answer(AnswerMessage::FileAck(msg)) => {
                     ensure!(msg == "ok", TransferError::AckError);
                 },
                 _ => {
@@ -163,11 +173,11 @@ where
     super::handle_run_result(wormhole, result).await
 }
 
-pub async fn send_folder<N, M, G, H>(
+pub async fn send_folder<N, G, H>(
     mut wormhole: Wormhole,
     relay_hints: Vec<transit::RelayHint>,
     folder_path: N,
-    folder_name: M,
+    folder_name: impl Into<String>,
     transit_abilities: transit::Abilities,
     transit_handler: G,
     progress_handler: H,
@@ -175,7 +185,6 @@ pub async fn send_folder<N, M, G, H>(
 ) -> Result<(), TransferError>
 where
     N: Into<PathBuf>,
-    M: Into<PathBuf>,
     G: FnOnce(transit::TransitInfo, std::net::SocketAddr),
     H: FnMut(u64, u64) + 'static,
 {
@@ -193,7 +202,7 @@ where
         // We want to do some transit
         debug!("Sending transit message '{:?}", connector.our_hints());
         wormhole
-            .send_json(&PeerMessage::transit(
+            .send_json(&PeerMessage::transit_v1(
                 *connector.our_abilities(),
                 (**connector.our_hints()).clone(),
             ))
@@ -253,7 +262,7 @@ where
         // Send file offer message.
         debug!("Sending file offer");
         wormhole
-            .send_json(&PeerMessage::offer_file(folder_name, length))
+            .send_json(&PeerMessage::offer_file_v1(folder_name, length))
             .await?;
 
         // Wait for their transit response
@@ -270,7 +279,7 @@ where
 
         // Wait for file_ack
         match wormhole.receive_json::<PeerMessage>().await??.check_err()? {
-            PeerMessage::Answer(Answer::FileAck(msg)) => {
+            PeerMessage::Answer(AnswerMessage::FileAck(msg)) => {
                 ensure!(msg == "ok", TransferError::AckError);
             },
             other => {
@@ -395,7 +404,7 @@ pub async fn request_file(
         // send the transit message
         debug!("Sending transit message '{:?}", connector.our_hints());
         wormhole
-            .send_json(&PeerMessage::transit(
+            .send_json(&PeerMessage::transit_v1(
                 *connector.our_abilities(),
                 (**connector.our_hints()).clone(),
             ))
@@ -416,13 +425,13 @@ pub async fn request_file(
         // 3. receive file offer message from peer
         let (filename, filesize) = match wormhole.receive_json::<PeerMessage>().await??.check_err()? {
             PeerMessage::Offer(offer_type) => match offer_type {
-                v1::Offer::File { filename, filesize } => (filename, filesize),
-                v1::Offer::Directory {
+                v1::OfferMessage::File { filename, filesize } => (filename, filesize),
+                v1::OfferMessage::Directory {
                     mut dirname,
                     zipsize,
                     ..
                 } => {
-                    dirname.set_extension("zip");
+                    dirname.push_str(".zip");
                     (dirname, zipsize)
                 },
                 _ => bail!(TransferError::UnsupportedOffer),
@@ -435,31 +444,44 @@ pub async fn request_file(
         Ok((filename, filesize, connector, their_abilities, their_hints))
     });
 
-    match crate::util::cancellable(run, cancel).await {
-        Ok(Ok((filename, filesize, connector, their_abilities, their_hints))) => {
-            Ok(Some(ReceiveRequest {
+    futures::pin_mut!(cancel);
+    let result = crate::util::cancellable_2(run, cancel).await;
+    handle_run_result_full(wormhole, result).await
+        .map(|inner: Option<_>| inner.map(
+            |(filename, filesize, connector, their_abilities, their_hints)| ReceiveRequest {
                 wormhole,
                 filename,
                 filesize,
                 connector,
                 their_abilities,
                 their_hints: Arc::new(their_hints),
-            }))
-        },
-        Ok(Err(error @ TransferError::PeerError(_))) => Err(error),
-        Ok(Err(error)) => {
-            let _ = wormhole
-                .send_json(&PeerMessage::Error(format!("{}", error)))
-                .await;
-            Err(error)
-        },
-        Err(cancelled) => {
-            let _ = wormhole
-                .send_json(&PeerMessage::Error(format!("{}", cancelled)))
-                .await;
-            Ok(None)
-        },
-    }
+            }
+        ))
+    // match crate::util::cancellable(run, cancel).await {
+    //     Ok(Ok((filename, filesize, connector, their_abilities, their_hints))) => {
+    //         Ok(Some(ReceiveRequest {
+    //             wormhole,
+    //             filename,
+    //             filesize,
+    //             connector,
+    //             their_abilities,
+    //             their_hints: Arc::new(their_hints),
+    //         }))
+    //     },
+    //     Ok(Err(error @ TransferError::PeerError(_))) => Err(error),
+    //     Ok(Err(error)) => {
+    //         let _ = wormhole
+    //             .send_json(&PeerMessage::Error(format!("{}", error)))
+    //             .await;
+    //         Err(error)
+    //     },
+    //     Err(cancelled) => {
+    //         let _ = wormhole
+    //             .send_json(&PeerMessage::Error(format!("{}", cancelled)))
+    //             .await;
+    //         Ok(None)
+    //     },
+    // }
 }
 
 /**
@@ -471,35 +493,47 @@ pub struct ReceiveRequest {
     wormhole: Wormhole,
     connector: TransitConnector,
     /// **Security warning:** this is untrusted and unverified input
-    pub filename: PathBuf,
+    pub filename: String,
     pub filesize: u64,
     their_abilities: transit::Abilities,
     their_hints: Arc<transit::Hints>,
 }
 
 impl ReceiveRequest {
+    pub fn offer(&self) -> &Arc<super::Offer> {
+        let mut content = HashMap::new();
+        content.insert(self.filename, OfferEntry::RegularFile {
+            size: self.filesize,
+        });
+        &Arc::new(super::Offer {
+            content
+        })
+    }
+
     /**
      * Accept the file offer
      *
      * This will transfer the file and save it on disk.
      */
-    pub async fn accept<F, G, W>(
+    pub async fn accept<F, G>(
         mut self,
         transit_handler: G,
+        mut answer: Answer,
         progress_handler: F,
-        content_handler: &mut W,
         cancel: impl Future<Output = ()>,
     ) -> Result<(), TransferError>
     where
         F: FnMut(u64, u64) + 'static,
         G: FnOnce(transit::TransitInfo, std::net::SocketAddr),
-        W: AsyncWrite + Unpin,
     {
+        assert!(answer.files.len() == 1, "Internal error");
+        let mut content_handler = (answer.files.values_mut().next().unwrap().content)().await?;
+
         let run = Box::pin(async {
             // send file ack.
             debug!("Sending ack");
             self.wormhole
-                .send_json(&PeerMessage::file_ack("ok"))
+                .send_json(&PeerMessage::file_ack_v1("ok"))
                 .await?;
 
             let (mut transit, info, addr) = self
@@ -519,7 +553,7 @@ impl ReceiveRequest {
                 &mut transit,
                 self.filesize,
                 progress_handler,
-                content_handler,
+                &mut content_handler,
             )
             .await?;
             Ok(())

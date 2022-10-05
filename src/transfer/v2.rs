@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use futures::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use sha2::{digest::FixedOutput, Digest, Sha256};
 use serde_derive::{Deserialize, Serialize};
@@ -37,8 +35,8 @@ pub struct TransitV2 {
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum PeerMessageV2 {
-    Offer(OfferMessage),
-    Answer(Answer),
+    Offer(Offer),
+    Answer(AnswerMessage),
     FileStart(FileStart),
     Payload(Payload),
     FileEnd(FileEnd),
@@ -70,55 +68,31 @@ impl PeerMessageV2 {
     }
 }
 
+// #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+// #[serde(rename_all = "kebab-case")]
+// pub struct OfferMessage {
+//     pub transfer_name: Option<String>,
+//     pub content: Offer,
+// }
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "kebab-case")]
-pub struct OfferMessage {
-    pub transfer_name: Option<String>,
-    pub content: OfferContent,
+pub struct AnswerMessage {
+    pub(self) files: Vec<AnswerMessageInner>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "kebab-case")]
-pub struct OfferContent {
-    pub name: String,
-    pub mtime: u64,
-    #[serde(flatten)]
-    pub inner: OfferContentInner,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-#[serde(rename_all = "kebab-case")]
-pub enum OfferContentInner {
-    RegularFile {
-        size: u64,
-        id: u64,
-    },
-    Directory {
-        content: Vec<OfferContent>,
-    },
-    Symlink {
-        target: String,
-    },
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-#[serde(rename_all = "kebab-case")]
-pub struct Answer {
-    pub files: Vec<AnswerInner>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-#[serde(rename_all = "kebab-case")]
-pub struct AnswerInner {
-    pub file: String,
+pub(self) struct AnswerMessageInner {
+    pub file: Vec<String>,
     pub offset: u64,
-    pub hash: Option<String>,
+    pub sha256: Option<[u8; 32]>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "kebab-case")]
 pub struct FileStart {
-    pub id: u64,
+    pub file: Vec<String>,
     pub start_at_offset: bool,
 }
 
@@ -138,19 +112,13 @@ pub struct FileEnd {
 pub struct TransferAck {
 }
 
-#[allow(unused_variables, unused_mut)]
-pub async fn send<C, F, H>(
+pub async fn send(
     mut wormhole: Wormhole,
     relay_hints: Vec<transit::RelayHint>,
-    offer: &Offer,
-    content: C,
-    progress_handler: H,
+    offer: OfferSend,
+    progress_handler: impl FnMut(u64, u64) + 'static,
     peer_version: AppVersion,
 ) -> Result<(), TransferError>
-where
-    C: FnMut(&str) -> F,
-    F: AsyncRead + AsyncSeek + Unpin,
-    H: FnMut(u64, u64) + 'static,
 {
     let peer_abilities = peer_version.transfer_v2.unwrap();
     let mut actual_transit_abilities = transit::Abilities::ALL_ABILITIES;
@@ -206,8 +174,7 @@ where
 
     match send_inner(
         &mut transit,
-        &offer,
-        content,
+        offer,
         progress_handler,
     ).await {
         Ok(()) => (),
@@ -224,21 +191,13 @@ where
 }
 
 /** We've established the transit connection and closed the Wormhole */
-async fn send_inner<C, F, H>(
+async fn send_inner(
     transit: &mut transit::Transit,
-    offer: &OfferContent,
-    mut content: C,
-    mut progress_handler: H,
+    mut offer: OfferSend,
+    mut progress_handler: impl FnMut(u64, u64) + 'static,
 ) -> Result<(), TransferError>
-where
-    C: FnMut(&str) -> F,
-    F: AsyncRead + AsyncSeek + Unpin,
-    H: FnMut(u64, u64) + 'static,
 {
-    transit.send_record(&PeerMessageV2::Offer(OfferMessage {
-        transfer_name: None,
-        content: offer.clone(),
-    }).ser_msgpack()).await?;
+    transit.send_record(&PeerMessageV2::Offer((&offer).into()).ser_msgpack()).await?;
 
     let files = match PeerMessageV2::de_msgpack(&transit.receive_record().await?)?.check_err()? {
         PeerMessageV2::Answer(answer) => {
@@ -249,32 +208,42 @@ where
         },
     };
 
+    for file in &files {
+        if offer.get_file(&file.file).is_none() {
+            bail!(TransferError::Protocol(format!(
+                "Invalid file request: {}",
+                file.file.join("/")
+            ).into()));
+        }
+    }
+
     // use zstd::stream::raw::Encoder;
     // let zstd = Encoder::new(zstd::DEFAULT_COMPRESSION_LEVEL);
     let mut buffer = Box::new([0u8; 16 * 1024]);
 
-    for AnswerInner {file, offset, hash} in &files {
+    for AnswerMessageInner {file, offset, sha256} in &files {
         let mut offset = *offset;
-        let mut content = content(file);
+        let mut content = (offer.get_file(&file).unwrap())().await?;
+        let file = file.clone();
 
         /* If they specified a hash, check our local file's contents */
-        if let Some(hash) = hash {
+        if let Some(sha256) = sha256 {
             content.seek(std::io::SeekFrom::Start(offset)).await?;
             let mut hasher = Sha256::default();
             async_std::io::copy(
-                content.take(offset),
+                (&mut content).take(offset),
                 futures::io::AllowStdIo::new(&mut hasher),
             ).await?;
             let our_hash = hasher.finalize_fixed();
 
             /* If it doesn't match, start at 0 instead of the originally requested offset */
-            if our_hash == hash {
+            if &*our_hash == &sha256[..] {
                 transit.send_record(
-                    &PeerMessageV2::FileStart(FileStart { id: file, start_at_offset: true }).ser_msgpack()
+                    &PeerMessageV2::FileStart(FileStart { file, start_at_offset: true }).ser_msgpack()
                 ).await?;
             } else {
                 transit.send_record(
-                    &PeerMessageV2::FileStart(FileStart { id: file, start_at_offset: false }).ser_msgpack()
+                    &PeerMessageV2::FileStart(FileStart { file, start_at_offset: false }).ser_msgpack()
                 ).await?;
                 content.seek(std::io::SeekFrom::Start(0)).await?;
                 offset = 0;
@@ -282,7 +251,7 @@ where
         } else {
             content.seek(std::io::SeekFrom::Start(offset)).await?;
             transit.send_record(
-                &PeerMessageV2::FileStart(FileStart { id: file, start_at_offset: true }).ser_msgpack()
+                &PeerMessageV2::FileStart(FileStart { file, start_at_offset: true }).ser_msgpack()
             ).await?;
         }
 
@@ -317,7 +286,7 @@ where
     Ok(())
 }
 
-pub async fn request_offer(
+pub async fn request(
     mut wormhole: Wormhole,
     relay_hints: Vec<transit::RelayHint>,
     peer_version: AppVersion,
@@ -353,7 +322,7 @@ pub async fn request_offer(
         };
 
     /* Get a transit connection */
-    let (mut transit, _info, _addr) = match connector
+    let (mut transit, info, addr) = match connector
         .leader_connect(
             wormhole.key().derive_transit_key(wormhole.appid()),
             peer_abilities.transit_abilities,
@@ -381,19 +350,23 @@ pub async fn request_offer(
         },
     };
 
-    Ok(ReceiveRequest::new(transit, offer))
+    Ok(ReceiveRequest::new(transit, offer, info, addr))
 }
 
 pub(super) struct ReceiveRequest {
     transit: Transit,
     offer: Arc<Offer>,
+    info: transit::TransitInfo,
+    addr: std::net::SocketAddr,
 }
 
 impl ReceiveRequest {
-    pub fn new(transit: Transit, offer: Offer) -> Self {
+    pub fn new(transit: Transit, offer: Offer, info: transit::TransitInfo, addr: std::net::SocketAddr) -> Self {
         Self {
             transit,
             offer: Arc::new(offer),
+            info,
+            addr,
         }
     }
 
@@ -401,28 +374,32 @@ impl ReceiveRequest {
         &self.offer
     }
 
-    pub async fn accept<W>(
+    pub async fn accept(
         mut self,
-        mut offsets: impl FnMut(&str) -> Option<AnswerInner>,
-        content: impl FnMut(&str) -> W,
+        transit_handler: impl FnOnce(transit::TransitInfo, std::net::SocketAddr),
+        answer: Answer,
         progress_handler: impl FnMut(u64, u64) + 'static,
+        cancel: impl Future<Output = ()>,
     ) -> Result<(), TransferError>
-    where
-        W: AsyncWrite + AsyncSeek + Unpin
     {
-        let files: Vec<AnswerInner> = self.offer.list_file_paths()
-            .filter_map(|file| offsets(&file))
-            .collect();
+        transit_handler(self.info, self.addr);
+
         self.transit.send_record(
-            &PeerMessageV2::Answer(Answer {
-                files: files.clone(),
+            &PeerMessageV2::Answer(AnswerMessage {
+                files: answer.files.iter()
+                    .map(|(path, inner)| AnswerMessageInner {
+                        file: path.clone(),
+                        offset: inner.offset,
+                        sha256: inner.sha256,
+                    })
+                    .collect(),
             }).ser_msgpack()
         ).await?;
 
         receive_inner(
             &mut self.transit,
             &self.offer,
-            content,
+            answer,
             progress_handler,
         ).await
     }
@@ -438,29 +415,38 @@ impl ReceiveRequest {
 }
 
 /** We've established the transit connection and closed the Wormhole */
-async fn receive_inner<C, F, H>(
+async fn receive_inner(
     transit: &mut transit::Transit,
     offer: &Arc<Offer>,
-    mut content: C,
-    mut progress_handler: H,
+    our_answer: Answer,
+    mut progress_handler: impl FnMut(u64, u64) + 'static,
 ) -> Result<(), TransferError>
-where
-    C: FnMut(&str) -> F,
-    F: AsyncWrite + AsyncSeek + Unpin,
-    H: FnMut(u64, u64) + 'static,
 {
-/*
-    for i in 0..todo!() {
-        let mut content = content(i);
+
+    let n_accepted = our_answer.files.len();
+    for (i, (file, mut answer)) in our_answer.files.into_iter().enumerate() {
         let fileStart = match PeerMessageV2::de_msgpack(&transit.receive_record().await?)?.check_err()? {
             PeerMessageV2::FileStart(fileStart) => fileStart,
+            PeerMessageV2::TransferAck(_) => {
+                bail!(TransferError::Protocol(format!("Unexpected message: got 'transfer-ack' but expected {} more 'file-start' messages", n_accepted - i).into_boxed_str()))
+            }
             other => {
-                bail!(TransferError::unexpected_message("offer", other))
+                bail!(TransferError::unexpected_message("file-start", other))
             },
         };
+        ensure!(
+            fileStart.file == file,
+            TransferError::Protocol(format!(
+                "Unexpected file: got file {} but expected {}",
+                fileStart.file.join("/"),
+                file.join("/"),
+            ).into_boxed_str())
+        );
+
+        let mut content = (answer.content)().await?;
         let mut received_size = 0;
         if fileStart.start_at_offset {
-            let offset = todo!();
+            let offset = answer.offset;
             content.seek(std::io::SeekFrom::Start(offset)).await?;
             received_size = offset;
         } else {
@@ -470,6 +456,9 @@ where
         loop {
             let payload = match PeerMessageV2::de_msgpack(&transit.receive_record().await?)?.check_err()? {
                 PeerMessageV2::Payload(payload) => payload.payload,
+                PeerMessageV2::FileEnd(_) => {
+                    bail!(TransferError::Protocol(format!("Unexpected message: got 'file-end' but expected {} more payload bytes", todo!()).into_boxed_str()))
+                },
                 other => {
                     bail!(TransferError::unexpected_message("payload", other))
                 },
@@ -489,7 +478,17 @@ where
                 bail!(TransferError::unexpected_message("file-end", other))
             },
         };
-    }*/
+    }
+
+    let transferAck = match PeerMessageV2::de_msgpack(&transit.receive_record().await?)?.check_err()? {
+        PeerMessageV2::TransferAck(transferAck) => transferAck,
+        PeerMessageV2::FileStart(_) => {
+            bail!(TransferError::Protocol(format!("Unexpected message: got 'file-start' but did not expect any more files").into_boxed_str()))
+        }
+        other => {
+            bail!(TransferError::unexpected_message("file-start", other))
+        },
+    };
 
     todo!()
 }

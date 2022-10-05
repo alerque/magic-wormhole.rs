@@ -17,12 +17,11 @@ use std::sync::Arc;
 use super::{core::WormholeError, transit,  AppID, Wormhole};
 use futures::Future;
 use log::*;
-use std::{borrow::Cow, path::PathBuf};
+use std::{borrow::Cow, path::{Path, PathBuf}};
 use std::pin::Pin;
 use transit::{Transit, TransitConnectError, TransitConnector, TransitError, Abilities as TransitAbilities};
+use std::{collections::{HashMap, BTreeMap}};
 
-mod messages;
-use messages::*;
 mod v1;
 mod v2;
 
@@ -176,6 +175,14 @@ impl Default for AppVersionTransferV2Hint {
     }
 }
 
+pub trait AsyncReadSeek: AsyncRead + AsyncSeek {}
+
+impl <T> AsyncReadSeek for T where T: AsyncRead + AsyncSeek {}
+
+pub trait AsyncWriteSeek: AsyncWrite + AsyncSeek {}
+
+impl <T> AsyncWriteSeek for T where T: AsyncWrite + AsyncSeek {}
+
 /**
  * The type of message exchanged over the wormhole for this protocol
  */
@@ -185,8 +192,8 @@ impl Default for AppVersionTransferV2Hint {
 pub enum PeerMessage {
     /* V1 */
     Transit(v1::TransitV1),
-    Offer(v1::Offer),
-    Answer(v1::Answer),
+    Offer(v1::OfferMessage),
+    Answer(v1::AnswerMessage),
     /* V2 */
     TransitV2(v2::TransitV2),
 
@@ -197,26 +204,26 @@ pub enum PeerMessage {
 }
 
 impl PeerMessage {
-    pub fn offer_message(msg: impl Into<String>) -> Self {
-        PeerMessage::Offer(v1::Offer::Message(msg.into()))
+    fn offer_message_v1(msg: impl Into<String>) -> Self {
+        PeerMessage::Offer(v1::OfferMessage::Message(msg.into()))
     }
 
-    pub fn offer_file(name: impl Into<PathBuf>, size: u64) -> Self {
-        PeerMessage::Offer(v1::Offer::File {
+    fn offer_file_v1(name: impl Into<String>, size: u64) -> Self {
+        PeerMessage::Offer(v1::OfferMessage::File {
             filename: name.into(),
             filesize: size,
         })
     }
 
     #[allow(dead_code)]
-    pub fn offer_directory(
-        name: impl Into<PathBuf>,
+    fn offer_directory_v1(
+        name: impl Into<String>,
         mode: impl Into<String>,
         compressed_size: u64,
         numbytes: u64,
         numfiles: u64,
     ) -> Self {
-        PeerMessage::Offer(v1::Offer::Directory {
+        PeerMessage::Offer(v1::OfferMessage::Directory {
             dirname: name.into(),
             mode: mode.into(),
             zipsize: compressed_size,
@@ -226,30 +233,30 @@ impl PeerMessage {
     }
 
     #[allow(dead_code)]
-    pub fn message_ack(msg: impl Into<String>) -> Self {
-        PeerMessage::Answer(v1::Answer::MessageAck(msg.into()))
+    fn message_ack_v1(msg: impl Into<String>) -> Self {
+        PeerMessage::Answer(v1::AnswerMessage::MessageAck(msg.into()))
     }
 
-    pub fn file_ack(msg: impl Into<String>) -> Self {
-        PeerMessage::Answer(v1::Answer::FileAck(msg.into()))
+    fn file_ack_v1(msg: impl Into<String>) -> Self {
+        PeerMessage::Answer(v1::AnswerMessage::FileAck(msg.into()))
     }
 
-    pub fn error_message(msg: impl Into<String>) -> Self {
+    fn error_message(msg: impl Into<String>) -> Self {
         PeerMessage::Error(msg.into())
     }
 
-    pub fn transit(abilities: TransitAbilities, hints: transit::Hints) -> Self {
+    fn transit_v1(abilities: TransitAbilities, hints: transit::Hints) -> Self {
         PeerMessage::Transit(v1::TransitV1 {
             abilities_v1: abilities,
             hints_v1: hints,
         })
     }
 
-    pub fn transit_v2(hints_v2: transit::Hints) -> Self {
+    fn transit_v2(hints_v2: transit::Hints) -> Self {
         PeerMessage::TransitV2(v2::TransitV2 { hints_v2 })
     }
 
-    pub fn check_err(&self) -> Result<Self, TransferError> {
+    fn check_err(&self) -> Result<Self, TransferError> {
         match self {
             Self::Error(err) => Err(TransferError::PeerError(err.clone())),
             other => Ok(other.clone()),
@@ -257,231 +264,335 @@ impl PeerMessage {
     }
 
     #[allow(dead_code)]
-    pub fn ser_json(&self) -> Vec<u8> {
+    fn ser_json(&self) -> Vec<u8> {
         serde_json::to_vec(self).unwrap()
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum Offer {
-    RegularFile {
-        name: String,
-        mtime: u64,
-        size: u64,
-    },
-    Directory {
-        name: String,
-        mtime: u64,
-        content: Vec<Offer>,
-    },
-    Symlink {
-        name: String,
-        mtime: u64,
-        target: String,
-    },
+pub struct OfferSend {
+    content: HashMap<String, OfferSendEntry>,
 }
 
-impl Offer {
-    pub fn new(path: impl AsRef<std::path::Path>) -> Pin<Box<dyn Future<Output=std::io::Result<Self>>>> {
-        Box::pin(async {
-            let path = path.as_ref();
-            let metadata = async_std::fs::symlink_metadata(path).await?;
-            let name = path.file_name().expect("TODO error handling").to_str().expect("TODO error handling").to_owned();
-            let mtime = metadata.modified()?
-                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            if metadata.is_file() {
-                Ok(Self::RegularFile {
-                    name,
-                    mtime,
-                    size: metadata.len(),
-                })
-            } else if metadata.is_symlink() {
-                let target = async_std::fs::read_link(path).await?;
-                Ok(Self::Symlink {
-                    name,
-                    mtime,
-                    target: target.to_str().expect("TODO error handling").to_string(),
-                })
-            } else if metadata.is_dir() {
-                use futures::{StreamExt, TryStreamExt};
-
-                let content: Vec<Offer> = async_std::fs::read_dir(path)
-                    .await?
-                    .and_then(|file| async move {
-                        Self::new(file.path()).await
-                    })
-                    .try_collect()
-                    .await?;
-                Ok(Self::Directory {
-                    name,
-                    mtime,
-                    content,
-                })
-            } else {
-                unreachable!()
-            }
+impl OfferSend {
+    /// Offer a single path (file or folder)
+    async fn new_file_or_folder(
+        offer_name: String,
+        path: &Path,
+    ) -> std::io::Result<Self> {
+        let mut content = HashMap::new();
+        content.insert(offer_name, OfferSendEntry::new(path).await?);
+        Ok(Self {
+            content: content
         })
     }
 
+    /// Offer a single file with custom content
+    ///
+    /// You must ensure that the Reader contains exactly as many bytes
+    /// as advertized in file_size.
+    async fn new_file_custom(
+        offer_name: String,
+        size: u64,
+        content: OfferContent,
+    ) -> Self {
+        let mut content_ = HashMap::new();
+        content_.insert(offer_name, OfferSendEntry::RegularFile {
+            size,
+            content,
+        });
+        Self {
+            content: content_
+        }
+    }
+
     /** Recursively list all file paths, without directory names or symlinks. */
-    pub fn list_file_paths(&self) -> impl Iterator<Item = String> + '_ {
-        // TODO I couldn't think up a less efficient way to do this ^^
-        match self {
-            Self::RegularFile { name, .. } => {
-                Box::new(std::iter::once(name.clone())) as Box<dyn Iterator<Item = String>>
-            },
-            Self::Directory { name, content, .. } => {
+    fn list_file_paths(&self) -> impl Iterator<Item = String> + '_ {
+        self.content.iter()
+            .flat_map(|(name, offer)| {
                 let name = name.clone();
-                let iter = content.iter()
-                    .flat_map(Offer::list_file_paths)
-                    .map(move |path| format!("{name}/{path}"));
-                Box::new(iter) as Box<dyn Iterator<Item = String>>
-            },
-            Self::Symlink { .. } => {
-                Box::new(std::iter::empty()) as Box<dyn Iterator<Item = String>>
+                offer.list_file_paths()
+                    .map(move |path| format!("{name}/{path}"))
+            })
+    }
+
+    fn get_file(&mut self, path: &[String]) -> Option<&mut OfferContent> {
+        match path {
+            [] => None,
+            [start, rest @ ..] => {
+                self.content.get_mut(start)
+                    .and_then(|inner| inner.get_file(rest))
             }
         }
     }
 }
 
-pub async fn send_v2<R: AsyncRead + AsyncSeek + Send>(
-    wormhole: Wormhole,
-    relay_url: url::Url,
-    offer: Arc<Offer>,
-    offer_data: impl Fn(String) -> R,
-) -> Result<(), TransferError> {
-    todo!()
+type OfferContent = Box<dyn FnMut() -> futures::future::BoxFuture<'static, std::io::Result<Box<dyn AsyncReadSeek + Unpin + Send>>> + Send>;
+
+pub enum OfferSendEntry {
+    RegularFile {
+        size: u64,
+        content: OfferContent,
+    },
+    Directory {
+        content: BTreeMap<String, Self>,
+    },
+    Symlink {
+        target: String,
+    },
 }
 
-pub async fn send_file_or_folder<N, M, G, H>(
-    wormhole: Wormhole,
-    relay_url: url::Url,
-    file_path: N,
-    file_name: M,
-    transit_abilities: transit::Abilities,
-    transit_handler: G,
-    progress_handler: H,
-    cancel: impl Future<Output = ()>,
-) -> Result<(), TransferError>
-where
-    N: AsRef<async_std::path::Path>,
-    M: AsRef<async_std::path::Path>,
-    G: FnOnce(transit::TransitInfo, std::net::SocketAddr),
-    H: FnMut(u64, u64) + 'static,
-{
-    use async_std::fs::File;
-    let file_path = file_path.as_ref();
-    let file_name = file_name.as_ref();
+impl OfferSendEntry {
+    async fn new(path: impl AsRef<Path>) -> std::io::Result<Self> {
+        // Workaround for https://github.com/rust-lang/rust/issues/78649
+        #[inline(always)]
+        fn new_recurse<'a>(path: impl AsRef<Path> + 'a + Send) -> futures::future::BoxFuture<'a, std::io::Result<OfferSendEntry>> {
+            Box::pin(OfferSendEntry::new(path))
+        }
 
-    let mut file = File::open(file_path).await?;
-    let metadata = file.metadata().await?;
-    if metadata.is_dir() {
-        send_folder(
-            wormhole,
-            relay_url,
-            file_path,
-            file_name,
-            transit_abilities,
-            transit_handler,
-            progress_handler,
-            cancel,
-        )
-        .await?;
-    } else {
-        let file_size = metadata.len();
-        send_file(
-            wormhole,
-            relay_url,
-            &mut file,
-            file_name,
-            file_size,
-            transit_abilities,
-            transit_handler,
-            progress_handler,
-            cancel,
-        )
-        .await?;
+        let path = path.as_ref();
+        let metadata = async_std::fs::symlink_metadata(path).await?;
+        // let mtime = metadata.modified()?
+        //     .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        //     .unwrap_or_default()
+        //     .as_secs();
+        if metadata.is_file() {
+            let path = path.to_owned();
+            Ok(Self::RegularFile {
+                size: metadata.len(),
+                content: Box::new(move || {
+                    let path = path.clone();
+                    Box::pin(async move {
+                        async_std::fs::File::open(path).await
+                            .map(|file| Box::new(file) as Box<dyn AsyncReadSeek + Unpin + Send>)
+                    }) as futures::future::BoxFuture<_>
+                }) as _
+            })
+        } else if metadata.is_symlink() {
+            let target = async_std::fs::read_link(path).await?;
+            Ok(Self::Symlink {
+                target: target.to_str().expect("TODO error handling").to_string(),
+            })
+        } else if metadata.is_dir() {
+            use futures::TryStreamExt;
+
+            let content: BTreeMap<String, Self> = async_std::fs::read_dir(path)
+                .await?
+                .and_then(|file| {
+                    use futures::FutureExt;
+
+                    let name = path.file_name().expect("TODO error handling").to_str().expect("TODO error handling").to_owned();
+                    new_recurse(file.path()).map(|res| res.map(|offer| (name, offer)))
+                })
+                .try_collect()
+                .await?;
+            Ok(Self::Directory {
+                content,
+            })
+        } else {
+            unreachable!()
+        }
     }
-    Ok(())
+
+    /** Recursively list all file paths, without directory names or symlinks. */
+    fn list_file_paths(&self) -> impl Iterator<Item = String> + '_ {
+        // TODO I couldn't think up a less efficient way to do this ^^
+        match self {
+            Self::Directory { content, .. } => {
+                let iter = content.iter()
+                    .flat_map(|(name, offer)| {
+                        let name = name.clone();
+                        offer.list_file_paths()
+                            .map(move |path| format!("{name}/{path}"))
+                    });
+                Box::new(iter) as Box<dyn Iterator<Item = String>>
+            },
+            _ => {
+                Box::new(std::iter::empty()) as Box<dyn Iterator<Item = String>>
+            }
+        }
+    }
+
+    fn get_file(&mut self, path: &[String]) -> Option<&mut OfferContent> {
+        match path {
+            [] => Some(match self {
+                Self::RegularFile { content, ..} => Some(content),
+                _ => None,
+            }),
+            [start, rest @ ..] => match self {
+                Self::Directory { content, ..} => {
+                    content.get_mut(start)
+                        .and_then(|inner| inner.get_file(rest))
+                },
+                _ => None,
+            },
+        }
+    }
 }
 
-/// Send a file to the other side
-///
-/// You must ensure that the Reader contains exactly as many bytes
-/// as advertized in file_size.
-pub async fn send_file<F, N, G, H>(
-    wormhole: Wormhole,
-    relay_url: url::Url,
-    file: &mut F,
-    file_name: N,
-    file_size: u64,
-    transit_abilities: transit::Abilities,
-    transit_handler: G,
-    progress_handler: H,
-    cancel: impl Future<Output = ()>,
-) -> Result<(), TransferError>
-where
-    F: AsyncRead + Unpin,
-    N: Into<PathBuf>,
-    G: FnOnce(transit::TransitInfo, std::net::SocketAddr),
-    H: FnMut(u64, u64) + 'static,
-{
-    let _peer_version: AppVersion = serde_json::from_value(wormhole.peer_version.clone())?;
-    let relay_hints = vec![transit::RelayHint::from_urls(None, [relay_url])];
-    // if peer_version.supports_v2() && false {
-    //     v2::send_file(wormhole, relay_url, file, file_name, file_size, progress_handler, peer_version).await
-    // } else {
-    //     log::info!("TODO");
-    v1::send_file(
-        wormhole,
-        relay_hints,
-        file,
-        file_name,
-        file_size,
-        transit_abilities,
-        transit_handler,
-        progress_handler,
-        cancel,
-    )
-    .await
-    // }
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub struct Offer {
+    content: HashMap<String, OfferEntry>,
 }
 
-/// Send a folder to the other side
-///
-/// This isn't a proper folder transfer as per the Wormhole protocol
-/// because it sends it in a way so that the receiver still has to manually
-/// unpack it. But it's better than nothing
-pub async fn send_folder<N, M, G, H>(
+impl Offer {
+    /** Recursively list all file paths, without directory names or symlinks. */
+    pub fn list_file_paths(&self) -> impl Iterator<Item = Vec<String>> + '_ {
+        // FIXME this logic is likely broken
+        self.content.iter()
+            .flat_map(|(name, offer)| {
+                let name = name.clone();
+                offer.list_file_paths()
+                    .map(move |mut path| {
+                        path.insert(0, name.clone());
+                        path
+                    })
+            })
+    }
+
+    pub fn get(&self, path: &[String]) -> Option<&OfferEntry> {
+        match path {
+            [] => None,
+            [start, rest @ ..] => {
+                self.content.get(start)
+                    .and_then(|inner| inner.get(rest))
+            }
+        }
+    }
+
+    pub fn accept_all(&self) -> Answer {
+        Answer {
+            files: self.list_file_paths()
+                .map(|_| todo!())
+                .collect(),
+        }
+    }
+}
+
+impl From<OfferSend> for Offer {
+    fn from(from: OfferSend) -> Self {
+        Self {
+            content: from.content.into_iter()
+                .map(|(k, v)| (k, v.into()))
+                .collect()
+        }
+    }
+}
+
+impl From<&OfferSend> for Offer {
+    fn from(from: &OfferSend) -> Self {
+        Self {
+            content: from.content.iter()
+                .map(|(k, v)| (k.clone(), v.into()))
+                .collect()
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+#[serde(tag = "type")]
+pub enum OfferEntry {
+    RegularFile {
+        size: u64,
+    },
+    Directory {
+        content: BTreeMap<String, Self>,
+    },
+    Symlink {
+        target: String,
+    },
+}
+
+impl OfferEntry {
+    /** Recursively list all file paths, without directory names or symlinks. */
+    fn list_file_paths(&self) -> impl Iterator<Item = Vec<String>> + '_ {
+        // TODO I couldn't think up a less efficient way to do this ^^
+        // FIXME this logic is likely broken
+        match self {
+            Self::Directory { content, .. } => {
+                let iter = content.iter()
+                    .flat_map(|(name, offer)| {
+                        let name = name.clone();
+                        offer.list_file_paths()
+                            .map(move |mut path| {
+                                path.insert(0, name.clone());
+                                path
+                            })
+                    });
+                Box::new(iter) as Box<dyn Iterator<Item = Vec<String>>>
+            },
+            _ => {
+                Box::new(std::iter::empty()) as Box<dyn Iterator<Item = Vec<String>>>
+            }
+        }
+    }
+
+    fn get(&self, path: &[String]) -> Option<&Self> {
+        match path {
+            [] => Some(self),
+            [start, rest @ ..] => match self {
+                Self::Directory { content, ..} => {
+                    content.get(start)
+                        .and_then(|inner| inner.get(rest))
+                },
+                _ => None,
+            }
+        }
+    }
+}
+
+impl From<OfferSendEntry> for OfferEntry {
+    fn from(from: OfferSendEntry) -> Self {
+        match from {
+            OfferSendEntry::RegularFile { size, .. } => Self::RegularFile { size },
+            OfferSendEntry::Directory { content } => Self::Directory {
+                content: content.into_iter().map(|(k, v)| (k, v.into())).collect()
+            },
+            OfferSendEntry::Symlink { target } => Self::Symlink { target },
+        }
+    }
+}
+
+impl From<&OfferSendEntry> for OfferEntry {
+    fn from(from: &OfferSendEntry) -> Self {
+        match from {
+            OfferSendEntry::RegularFile { size, .. } => Self::RegularFile { size: *size },
+            OfferSendEntry::Directory { content } => Self::Directory {
+                content: content.iter().map(|(k, v)| (k.clone(), v.into())).collect()
+            },
+            OfferSendEntry::Symlink { target } => Self::Symlink { target: target.clone() },
+        }
+    }
+}
+
+type AnswerContent = Box<dyn FnMut() -> futures::future::BoxFuture<'static, std::io::Result<Box<dyn AsyncWriteSeek + Unpin + Send>>> + Send>;
+
+pub struct Answer {
+    pub(self) files: BTreeMap<Vec<String>, AnswerInner>,
+}
+
+pub(self) struct AnswerInner {
+    pub offset: u64,
+    pub sha256: Option<[u8; 32]>,
+    pub content: AnswerContent,
+}
+
+pub async fn send(
     wormhole: Wormhole,
     relay_url: url::Url,
-    folder_path: N,
-    folder_name: M,
     transit_abilities: transit::Abilities,
-    transit_handler: G,
-    progress_handler: H,
-    cancel: impl Future<Output = ()>,
-) -> Result<(), TransferError>
-where
-    N: Into<PathBuf>,
-    M: Into<PathBuf>,
-    G: FnOnce(transit::TransitInfo, std::net::SocketAddr),
-    H: FnMut(u64, u64) + 'static,
-{
+    offer: OfferSend,
+    transit_handler: impl FnOnce(transit::TransitInfo, std::net::SocketAddr),
+    progress_handler: impl FnMut(u64, u64) + 'static,
+) -> Result<(), TransferError> {
+    let peer_version: AppVersion = serde_json::from_value(wormhole.peer_version.clone())?;
     let relay_hints = vec![transit::RelayHint::from_urls(None, [relay_url])];
-    v1::send_folder(
-        wormhole,
-        relay_hints,
-        folder_path,
-        folder_name,
-        transit_abilities,
-        transit_handler,
-        progress_handler,
-        cancel,
-    )
-    .await
+    if peer_version.supports_v2() && false {
+        v2::send(wormhole, relay_hints, offer, progress_handler, peer_version).await
+    } else {
+        v1::send(wormhole, relay_hints, offer, progress_handler, peer_version).await
+    }
 }
 
 /**
@@ -492,7 +603,7 @@ where
  *
  * Returns `None` if the task got cancelled.
  */
-pub async fn request_file(
+pub async fn request(
     mut wormhole: Wormhole,
     relay_url: url::Url,
     transit_abilities: transit::Abilities,
@@ -532,7 +643,7 @@ impl ReceiveRequest {
         mut self,
         transit_handler: G,
         progress_handler: F,
-        content_handler: &mut W,
+        answer: Answer,
         cancel: impl Future<Output = ()>,
     ) -> Result<(), TransferError>
     where
@@ -541,8 +652,8 @@ impl ReceiveRequest {
         W: AsyncWrite + Unpin,
     {
         match self.0 {
-            ReceiveRequestInner::V1(req) => req.accept(transit_handler, progress_handler, content_handler, cancel).await,
-            ReceiveRequestInner::V2(req) => req.accept(transit_handler, content_handler, progress_handler).await,
+            ReceiveRequestInner::V1(req) => req.accept(transit_handler, answer, progress_handler, cancel).await,
+            ReceiveRequestInner::V2(req) => req.accept(transit_handler, answer, progress_handler, cancel).await,
         }
     }
 
@@ -564,9 +675,18 @@ const SHUTDOWN_TIME: std::time::Duration = std::time::Duration::from_secs(5);
 
 /** Handle the post-{transfer, failure, cancellation} logic */
 async fn handle_run_result(
-    mut wormhole: Wormhole,
+    wormhole: Wormhole,
     result: Result<(Result<(), TransferError>, impl Future<Output = ()>), crate::util::Cancelled>,
 ) -> Result<(), TransferError> {
+    handle_run_result_full(wormhole, result).await
+        .map(Option::unwrap_or_default)
+}
+
+/** Handle the post-{transfer, failure, cancellation} logic */
+async fn handle_run_result_full<T>(
+    mut wormhole: Wormhole,
+    result: Result<(Result<T, TransferError>, impl Future<Output = ()>), crate::util::Cancelled>,
+) -> Result<Option<T>, TransferError> {
     async fn wrap_timeout(run: impl Future<Output = ()>, cancel: impl Future<Output = ()>) {
         let run = async_std::future::timeout(SHUTDOWN_TIME, run);
         futures::pin_mut!(run);
@@ -586,7 +706,7 @@ async fn handle_run_result(
 
     match result {
         /* Happy case: everything went okay */
-        Ok((Ok(()), cancel)) => {
+        Ok((Ok(val), cancel)) => {
             log::debug!("Transfer done, doing cleanup logic");
             wrap_timeout(
                 async {
@@ -595,7 +715,7 @@ async fn handle_run_result(
                 cancel,
             )
             .await;
-            Ok(())
+            Ok(Some(val))
         },
         /* Got peer error: stop everything immediately */
         Ok((Err(error @ TransferError::PeerError(_)), cancel)) => {
@@ -671,9 +791,36 @@ async fn handle_run_result(
                 futures::future::pending(),
             )
             .await;
-            Ok(())
+            Ok(None)
         },
     }
+}
+
+pub fn send_content_handler(base_path: &'_ Path) -> impl FnMut(&[String]) -> () + '_ {
+    |rel_path| {
+        let mut path = base_path.to_path_buf();
+        for p in rel_path {
+            path.push(p);
+        }
+
+        // async_std::fs::OpenOptions::new()
+        //     .write(true)
+        //     .open(path)
+        //     .await
+    } 
+}
+
+// type ReceiveContentHandler = Box<dyn FnMut(&[String]) -> futures::future::BoxedFuture<Box<dyn AsyncRead>
+
+pub fn receive_content_handler(base_path: &'_ Path) -> impl FnMut(&[String]) -> () + '_ {
+    |rel_path| {
+        let mut path = base_path.to_path_buf();
+        for p in rel_path {
+            path.push(p);
+        }
+
+        // async_std::fs::File::open(path).await
+    } 
 }
 
 #[cfg(test)]
@@ -693,7 +840,7 @@ mod test {
             )],
         );
         assert_eq!(
-            serde_json::json!(crate::transfer::PeerMessage::transit(abilities, hints)),
+            serde_json::json!(crate::transfer::PeerMessage::transit_v1(abilities, hints)),
             serde_json::json!({
                 "transit": {
                     "abilities-v1": [{"type":"direct-tcp-v1"},{"type":"relay-v1"}],
@@ -714,7 +861,7 @@ mod test {
 
     #[test]
     fn test_message() {
-        let m1 = PeerMessage::offer_message("hello from rust");
+        let m1 = PeerMessage::offer_message_v1("hello from rust");
         assert_eq!(
             serde_json::json!(m1).to_string(),
             "{\"offer\":{\"message\":\"hello from rust\"}}"
@@ -723,7 +870,7 @@ mod test {
 
     #[test]
     fn test_offer_file() {
-        let f1 = PeerMessage::offer_file("somefile.txt", 34556);
+        let f1 = PeerMessage::offer_file_v1("somefile.txt", 34556);
         assert_eq!(
             serde_json::json!(f1).to_string(),
             "{\"offer\":{\"file\":{\"filename\":\"somefile.txt\",\"filesize\":34556}}}"
@@ -732,7 +879,7 @@ mod test {
 
     #[test]
     fn test_offer_directory() {
-        let d1 = PeerMessage::offer_directory("somedirectory", "zipped", 45, 1234, 10);
+        let d1 = PeerMessage::offer_directory_v1("somedirectory", "zipped", 45, 1234, 10);
         assert_eq!(
             serde_json::json!(d1).to_string(),
             "{\"offer\":{\"directory\":{\"dirname\":\"somedirectory\",\"mode\":\"zipped\",\"numbytes\":1234,\"numfiles\":10,\"zipsize\":45}}}"
@@ -741,7 +888,7 @@ mod test {
 
     #[test]
     fn test_message_ack() {
-        let m1 = PeerMessage::message_ack("ok");
+        let m1 = PeerMessage::message_ack_v1("ok");
         assert_eq!(
             serde_json::json!(m1).to_string(),
             "{\"answer\":{\"message_ack\":\"ok\"}}"
@@ -750,7 +897,7 @@ mod test {
 
     #[test]
     fn test_file_ack() {
-        let f1 = PeerMessage::file_ack("ok");
+        let f1 = PeerMessage::file_ack_v1("ok");
         assert_eq!(
             serde_json::json!(f1).to_string(),
             "{\"answer\":{\"file_ack\":\"ok\"}}"
