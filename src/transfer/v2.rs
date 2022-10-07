@@ -290,7 +290,7 @@ pub async fn request(
     mut wormhole: Wormhole,
     relay_hints: Vec<transit::RelayHint>,
     peer_version: AppVersion,
-) -> Result<ReceiveRequest, TransferError> {
+) -> Result<Option<ReceiveRequest>, TransferError> {
     let peer_abilities = peer_version.transfer_v2.unwrap();
     let mut actual_transit_abilities = transit::Abilities::ALL_ABILITIES;
     actual_transit_abilities.intersect(&peer_abilities.transit_abilities);
@@ -350,10 +350,10 @@ pub async fn request(
         },
     };
 
-    Ok(ReceiveRequest::new(transit, offer, info, addr))
+    Ok(Some(ReceiveRequest::new(transit, offer, info, addr)))
 }
 
-pub(super) struct ReceiveRequest {
+pub struct ReceiveRequest {
     transit: Transit,
     offer: Arc<Offer>,
     info: transit::TransitInfo,
@@ -370,8 +370,8 @@ impl ReceiveRequest {
         }
     }
 
-    pub fn offer(&self) -> &Arc<Offer> {
-        &self.offer
+    pub fn offer(&self) -> Arc<Offer> {
+        self.offer.clone()
     }
 
     pub async fn accept(

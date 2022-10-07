@@ -414,10 +414,10 @@ impl OfferSendEntry {
 
     fn get_file(&mut self, path: &[String]) -> Option<&mut OfferContent> {
         match path {
-            [] => Some(match self {
+            [] => match self {
                 Self::RegularFile { content, ..} => Some(content),
                 _ => None,
-            }),
+            },
             [start, rest @ ..] => match self {
                 Self::Directory { content, ..} => {
                     content.get_mut(start)
@@ -604,12 +604,20 @@ pub async fn send(
  * Returns `None` if the task got cancelled.
  */
 pub async fn request(
-    mut wormhole: Wormhole,
+    wormhole: Wormhole,
     relay_url: url::Url,
     transit_abilities: transit::Abilities,
     cancel: impl Future<Output = ()>,
 ) -> Result<Option<ReceiveRequest>, TransferError> {
-    todo!()
+    let peer_version: AppVersion = serde_json::from_value(wormhole.peer_version.clone())?;
+    let relay_hints = vec![transit::RelayHint::from_urls(None, [relay_url])];
+    if peer_version.supports_v2() && false {
+        v2::request(wormhole, relay_hints, peer_version).await
+            .map(|req| req.map(ReceiveRequestInner::V2).map(ReceiveRequest))
+    } else {
+        v1::request(wormhole, relay_hints, transit_abilities, cancel).await
+            .map(|req| req.map(ReceiveRequestInner::V1).map(ReceiveRequest))
+    }
 }
 
 /**
@@ -627,7 +635,7 @@ enum ReceiveRequestInner {
 
 impl ReceiveRequest {
     /** The offer we got */
-    pub fn offer(&self) -> &Arc<Offer> {
+    pub fn offer(&self) -> Arc<Offer> {
         match &self.0 {
             ReceiveRequestInner::V1(req) => req.offer(),
             ReceiveRequestInner::V2(req) => req.offer(),
@@ -640,7 +648,7 @@ impl ReceiveRequest {
      * This will transfer the file and save it on disk.
      */
     pub async fn accept<F, G, W>(
-        mut self,
+        self,
         transit_handler: G,
         progress_handler: F,
         answer: Answer,
@@ -675,18 +683,123 @@ const SHUTDOWN_TIME: std::time::Duration = std::time::Duration::from_secs(5);
 
 /** Handle the post-{transfer, failure, cancellation} logic */
 async fn handle_run_result(
-    wormhole: Wormhole,
+    mut wormhole: Wormhole,
     result: Result<(Result<(), TransferError>, impl Future<Output = ()>), crate::util::Cancelled>,
 ) -> Result<(), TransferError> {
-    handle_run_result_full(wormhole, result).await
-        .map(Option::unwrap_or_default)
+    async fn wrap_timeout(run: impl Future<Output = ()>, cancel: impl Future<Output = ()>) {
+        let run = async_std::future::timeout(SHUTDOWN_TIME, run);
+        futures::pin_mut!(run);
+        match crate::util::cancellable(run, cancel).await {
+            Ok(Ok(())) => {},
+            Ok(Err(_timeout)) => log::debug!("Post-transfer timed out"),
+            Err(_cancelled) => log::debug!("Post-transfer got cancelled by user"),
+        };
+    }
+
+    /// Ignore an error but at least debug print it
+    fn debug_err(result: Result<(), WormholeError>, operation: &str) {
+        if let Err(error) = result {
+            log::debug!("Failed to {} after transfer: {}", operation, error);
+        }
+    }
+
+    match result {
+        /* Happy case: everything went okay */
+        Ok((Ok(()), cancel)) => {
+            log::debug!("Transfer done, doing cleanup logic");
+            wrap_timeout(
+                async {
+                    debug_err(wormhole.close().await, "close Wormhole");
+                },
+                cancel,
+            )
+            .await;
+            Ok(())
+        },
+        /* Got peer error: stop everything immediately */
+        Ok((Err(error @ TransferError::PeerError(_)), cancel)) => {
+            log::debug!(
+                "Transfer encountered an error ({}), doing cleanup logic",
+                error
+            );
+            wrap_timeout(
+                async {
+                    debug_err(wormhole.close().await, "close Wormhole");
+                },
+                cancel,
+            )
+            .await;
+            Err(error)
+        },
+        /* Got transit error: try receive peer error for better error message */
+        Ok((Err(mut error @ TransferError::Transit(_)), cancel)) => {
+            log::debug!(
+                "Transfer encountered an error ({}), doing cleanup logic",
+                error
+            );
+            wrap_timeout(async {
+                /* If transit failed, ask for a proper error and potentially use that instead */
+                // TODO this should be replaced with some try_receive that only polls already available messages,
+                // and we should not only look for the next one but all have been received
+                // and we should not interrupt a receive operation without making sure it leaves the connection
+                // in a consistent state, otherwise the shutdown may cause protocol errors
+                if let Ok(Ok(Ok(PeerMessage::Error(e)))) = async_std::future::timeout(SHUTDOWN_TIME / 3, wormhole.receive_json()).await {
+                    error = TransferError::PeerError(e);
+                } else {
+                    log::debug!("Failed to retrieve more specific error message from peer. Maybe it crashed?");
+                }
+                debug_err(wormhole.close().await, "close Wormhole");
+            }, cancel).await;
+            Err(error)
+        },
+        /* Other error: try to notify peer */
+        Ok((Err(error), cancel)) => {
+            log::debug!(
+                "Transfer encountered an error ({}), doing cleanup logic",
+                error
+            );
+            wrap_timeout(
+                async {
+                    debug_err(
+                        wormhole
+                            .send_json(&PeerMessage::Error(format!("{}", error)))
+                            .await,
+                        "notify peer about the error",
+                    );
+                    debug_err(wormhole.close().await, "close Wormhole");
+                },
+                cancel,
+            )
+            .await;
+            Err(error)
+        },
+        /* Cancelled: try to notify peer */
+        Err(cancelled) => {
+            log::debug!("Transfer got cancelled, doing cleanup logic");
+            /* Replace cancel with ever-pending future, as we have already been cancelled */
+            wrap_timeout(
+                async {
+                    debug_err(
+                        wormhole
+                            .send_json(&PeerMessage::Error(format!("{}", cancelled)))
+                            .await,
+                        "notify peer about our cancellation",
+                    );
+                    debug_err(wormhole.close().await, "close Wormhole");
+                },
+                futures::future::pending(),
+            )
+            .await;
+            Ok(())
+        },
+    }
 }
 
 /** Handle the post-{transfer, failure, cancellation} logic */
-async fn handle_run_result_full<T>(
+async fn handle_run_result_noclose<T>(
     mut wormhole: Wormhole,
     result: Result<(Result<T, TransferError>, impl Future<Output = ()>), crate::util::Cancelled>,
-) -> Result<Option<T>, TransferError> {
+) -> Result<Option<(T, Wormhole)>, TransferError> {
     async fn wrap_timeout(run: impl Future<Output = ()>, cancel: impl Future<Output = ()>) {
         let run = async_std::future::timeout(SHUTDOWN_TIME, run);
         futures::pin_mut!(run);
@@ -707,15 +820,7 @@ async fn handle_run_result_full<T>(
     match result {
         /* Happy case: everything went okay */
         Ok((Ok(val), cancel)) => {
-            log::debug!("Transfer done, doing cleanup logic");
-            wrap_timeout(
-                async {
-                    debug_err(wormhole.close().await, "close Wormhole");
-                },
-                cancel,
-            )
-            .await;
-            Ok(Some(val))
+            Ok(Some((val, wormhole)))
         },
         /* Got peer error: stop everything immediately */
         Ok((Err(error @ TransferError::PeerError(_)), cancel)) => {
@@ -794,33 +899,6 @@ async fn handle_run_result_full<T>(
             Ok(None)
         },
     }
-}
-
-pub fn send_content_handler(base_path: &'_ Path) -> impl FnMut(&[String]) -> () + '_ {
-    |rel_path| {
-        let mut path = base_path.to_path_buf();
-        for p in rel_path {
-            path.push(p);
-        }
-
-        // async_std::fs::OpenOptions::new()
-        //     .write(true)
-        //     .open(path)
-        //     .await
-    } 
-}
-
-// type ReceiveContentHandler = Box<dyn FnMut(&[String]) -> futures::future::BoxedFuture<Box<dyn AsyncRead>
-
-pub fn receive_content_handler(base_path: &'_ Path) -> impl FnMut(&[String]) -> () + '_ {
-    |rel_path| {
-        let mut path = base_path.to_path_buf();
-        for p in rel_path {
-            path.push(p);
-        }
-
-        // async_std::fs::File::open(path).await
-    } 
 }
 
 #[cfg(test)]

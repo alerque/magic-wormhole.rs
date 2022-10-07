@@ -170,7 +170,7 @@ where
 
     futures::pin_mut!(cancel);
     let result = crate::util::cancellable_2(run, cancel).await;
-    super::handle_run_result(wormhole, result).await
+    handle_run_result(wormhole, result).await
 }
 
 pub async fn send_folder<N, G, H>(
@@ -390,15 +390,14 @@ where
  *
  * Returns `None` if the task got cancelled.
  */
-pub async fn request_file(
+pub async fn request(
     mut wormhole: Wormhole,
-    relay_url: url::Url,
+    relay_hints: Vec<transit::RelayHint>,
     transit_abilities: transit::Abilities,
     cancel: impl Future<Output = ()>,
 ) -> Result<Option<ReceiveRequest>, TransferError> {
     // Error handling
     let run = Box::pin(async {
-        let relay_hints = vec![transit::RelayHint::from_urls(None, [relay_url])];
         let connector = transit::init(transit_abilities, None, relay_hints).await?;
 
         // send the transit message
@@ -446,9 +445,9 @@ pub async fn request_file(
 
     futures::pin_mut!(cancel);
     let result = crate::util::cancellable_2(run, cancel).await;
-    handle_run_result_full(wormhole, result).await
+    handle_run_result_noclose(wormhole, result).await
         .map(|inner: Option<_>| inner.map(
-            |(filename, filesize, connector, their_abilities, their_hints)| ReceiveRequest {
+            |((filename, filesize, connector, their_abilities, their_hints), wormhole)| ReceiveRequest {
                 wormhole,
                 filename,
                 filesize,
@@ -457,31 +456,6 @@ pub async fn request_file(
                 their_hints: Arc::new(their_hints),
             }
         ))
-    // match crate::util::cancellable(run, cancel).await {
-    //     Ok(Ok((filename, filesize, connector, their_abilities, their_hints))) => {
-    //         Ok(Some(ReceiveRequest {
-    //             wormhole,
-    //             filename,
-    //             filesize,
-    //             connector,
-    //             their_abilities,
-    //             their_hints: Arc::new(their_hints),
-    //         }))
-    //     },
-    //     Ok(Err(error @ TransferError::PeerError(_))) => Err(error),
-    //     Ok(Err(error)) => {
-    //         let _ = wormhole
-    //             .send_json(&PeerMessage::Error(format!("{}", error)))
-    //             .await;
-    //         Err(error)
-    //     },
-    //     Err(cancelled) => {
-    //         let _ = wormhole
-    //             .send_json(&PeerMessage::Error(format!("{}", cancelled)))
-    //             .await;
-    //         Ok(None)
-    //     },
-    // }
 }
 
 /**
@@ -500,12 +474,12 @@ pub struct ReceiveRequest {
 }
 
 impl ReceiveRequest {
-    pub fn offer(&self) -> &Arc<super::Offer> {
+    pub fn offer(&self) -> Arc<super::Offer> {
         let mut content = HashMap::new();
-        content.insert(self.filename, OfferEntry::RegularFile {
+        content.insert(self.filename.clone(), OfferEntry::RegularFile {
             size: self.filesize,
         });
-        &Arc::new(super::Offer {
+        Arc::new(super::Offer {
             content
         })
     }
