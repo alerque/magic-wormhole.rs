@@ -118,11 +118,12 @@ pub async fn send(
     offer: OfferSend,
     progress_handler: impl FnMut(u64, u64) + 'static,
     peer_version: AppVersion,
+    cancel: impl Future<Output = ()>,
 ) -> Result<(), TransferError>
 {
     let peer_abilities = peer_version.transfer_v2.unwrap();
     let mut actual_transit_abilities = transit::Abilities::ALL_ABILITIES;
-    actual_transit_abilities.intersect(&peer_abilities.transit_abilities);
+    actual_transit_abilities = actual_transit_abilities.intersect(&peer_abilities.transit_abilities);
     let connector = transit::init(actual_transit_abilities, Some(peer_abilities.transit_abilities), relay_hints).await?;
 
     /* Send our transit hints */
@@ -208,8 +209,11 @@ async fn send_inner(
         },
     };
 
+    let mut total_size = 0;
     for file in &files {
-        if offer.get_file(&file.file).is_none() {
+        if let Some((file, size)) = offer.get_file(&file.file) {
+            total_size += size;
+        } else {
             bail!(TransferError::Protocol(format!(
                 "Invalid file request: {}",
                 file.file.join("/")
@@ -219,11 +223,12 @@ async fn send_inner(
 
     // use zstd::stream::raw::Encoder;
     // let zstd = Encoder::new(zstd::DEFAULT_COMPRESSION_LEVEL);
-    let mut buffer = Box::new([0u8; 16 * 1024]);
+    const buffer_len: usize = 16 * 1024;
+    let mut buffer = Box::new([0u8; buffer_len]);
 
     for AnswerMessageInner {file, offset, sha256} in &files {
         let mut offset = *offset;
-        let mut content = (offer.get_file(&file).unwrap())().await?;
+        let mut content = (offer.get_file(&file).unwrap().0)().await?;
         let file = file.clone();
 
         /* If they specified a hash, check our local file's contents */
@@ -255,7 +260,8 @@ async fn send_inner(
             ).await?;
         }
 
-        let mut sent_size = 0;
+        let mut sent_size = offset;
+        progress_handler(sent_size, total_size);
         loop {
             let n = content.read(&mut buffer[..]).await?;
             let buffer = &buffer[..n];
@@ -269,9 +275,9 @@ async fn send_inner(
                 &PeerMessageV2::Payload(Payload { payload: buffer.into() }).ser_msgpack()
             ).await?;
             sent_size += n as u64;
-            progress_handler(sent_size, todo!());
+            progress_handler(sent_size, total_size);
 
-            if n < 4096 {
+            if n < buffer_len {
                 break;
             }
         }
@@ -384,6 +390,7 @@ impl ReceiveRequest {
     {
         transit_handler(self.info, self.addr);
 
+        let mut total_size = 0;
         self.transit.send_record(
             &PeerMessageV2::Answer(AnswerMessage {
                 files: answer.files.iter()
@@ -422,8 +429,12 @@ async fn receive_inner(
     mut progress_handler: impl FnMut(u64, u64) + 'static,
 ) -> Result<(), TransferError>
 {
-
     let n_accepted = our_answer.files.len();
+    // let total_size = our_answer.files.keys()
+    //     .map(|path| offer.get(path).expect("Mismatch betwene offer and accept").size)
+    //     .sum::<u64>()
+    //     .expect("Accept cannot be empty");
+    let total_size: u64 = todo!();
     for (i, (file, mut answer)) in our_answer.files.into_iter().enumerate() {
         let fileStart = match PeerMessageV2::de_msgpack(&transit.receive_record().await?)?.check_err()? {
             PeerMessageV2::FileStart(fileStart) => fileStart,
@@ -453,6 +464,7 @@ async fn receive_inner(
             content.seek(std::io::SeekFrom::Start(0)).await?;
         }
 
+        progress_handler(received_size, total_size);
         loop {
             let payload = match PeerMessageV2::de_msgpack(&transit.receive_record().await?)?.check_err()? {
                 PeerMessageV2::Payload(payload) => payload.payload,
@@ -466,6 +478,7 @@ async fn receive_inner(
 
             content.write_all(&payload).await?;
             received_size += payload.len() as u64;
+            progress_handler(received_size, total_size);
 
             if true {
                 break

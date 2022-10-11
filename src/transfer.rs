@@ -275,14 +275,14 @@ pub struct OfferSend {
 
 impl OfferSend {
     /// Offer a single path (file or folder)
-    async fn new_file_or_folder(
+    pub async fn new_file_or_folder(
         offer_name: String,
-        path: &Path,
+        path: impl AsRef<Path>,
     ) -> std::io::Result<Self> {
         let mut content = HashMap::new();
-        content.insert(offer_name, OfferSendEntry::new(path).await?);
+        content.insert(offer_name, OfferSendEntry::new(path.as_ref()).await?);
         Ok(Self {
-            content: content
+            content
         })
     }
 
@@ -290,7 +290,7 @@ impl OfferSend {
     ///
     /// You must ensure that the Reader contains exactly as many bytes
     /// as advertized in file_size.
-    async fn new_file_custom(
+    pub async fn new_file_custom(
         offer_name: String,
         size: u64,
         content: OfferContent,
@@ -306,7 +306,7 @@ impl OfferSend {
     }
 
     /** Recursively list all file paths, without directory names or symlinks. */
-    fn list_file_paths(&self) -> impl Iterator<Item = String> + '_ {
+    pub fn list_file_paths(&self) -> impl Iterator<Item = String> + '_ {
         self.content.iter()
             .flat_map(|(name, offer)| {
                 let name = name.clone();
@@ -315,7 +315,7 @@ impl OfferSend {
             })
     }
 
-    fn get_file(&mut self, path: &[String]) -> Option<&mut OfferContent> {
+    fn get_file(&mut self, path: &[String]) -> Option<(&mut OfferContent, u64)> {
         match path {
             [] => None,
             [start, rest @ ..] => {
@@ -412,10 +412,10 @@ impl OfferSendEntry {
         }
     }
 
-    fn get_file(&mut self, path: &[String]) -> Option<&mut OfferContent> {
+    fn get_file(&mut self, path: &[String]) -> Option<(&mut OfferContent, u64)> {
         match path {
             [] => match self {
-                Self::RegularFile { content, ..} => Some(content),
+                Self::RegularFile { content, size } => Some((content, *size)),
                 _ => None,
             },
             [start, rest @ ..] => match self {
@@ -466,6 +466,14 @@ impl Offer {
                 .map(|_| todo!())
                 .collect(),
         }
+    }
+
+    pub async fn create_directories(&self, target_path: &Path) -> std::io::Result<()> {
+        todo!()
+    }
+
+    pub async fn create_symlinks(&self, target_path: &Path) -> std::io::Result<()> {
+        todo!()
     }
 }
 
@@ -540,6 +548,14 @@ impl OfferEntry {
             }
         }
     }
+
+    async fn create_directories(&self, target_path: &Path) -> std::io::Result<()> {
+        todo!()
+    }
+
+    async fn create_symlinks(&self, target_path: &Path) -> std::io::Result<()> {
+        todo!()
+    }
 }
 
 impl From<OfferSendEntry> for OfferEntry {
@@ -585,13 +601,14 @@ pub async fn send(
     offer: OfferSend,
     transit_handler: impl FnOnce(transit::TransitInfo, std::net::SocketAddr),
     progress_handler: impl FnMut(u64, u64) + 'static,
+    cancel: impl Future<Output = ()>,
 ) -> Result<(), TransferError> {
     let peer_version: AppVersion = serde_json::from_value(wormhole.peer_version.clone())?;
     let relay_hints = vec![transit::RelayHint::from_urls(None, [relay_url])];
     if peer_version.supports_v2() && false {
-        v2::send(wormhole, relay_hints, offer, progress_handler, peer_version).await
+        v2::send(wormhole, relay_hints, offer, progress_handler, peer_version, cancel).await
     } else {
-        v1::send(wormhole, relay_hints, offer, progress_handler, peer_version).await
+        v1::send(wormhole, relay_hints, offer, progress_handler, peer_version, cancel).await
     }
 }
 

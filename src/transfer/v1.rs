@@ -72,6 +72,7 @@ pub async fn send(
     offer: OfferSend,
     progress_handler: impl FnMut(u64, u64) + 'static,
     peer_version: AppVersion,
+    cancel: impl Future<Output = ()>,
 ) -> Result<(), TransferError>
 {
     todo!()

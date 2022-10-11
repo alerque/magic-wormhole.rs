@@ -63,10 +63,11 @@ fn install_ctrlc_handler(
 #[derive(Debug, Args)]
 struct CommonSenderArgs {
     /// Suggest a different name to the receiver to keep the file's actual name secret.
+    /// Not allowed when sending more than one file.
     #[clap(long = "rename", visible_alias = "name", value_name = "FILE_NAME")]
-    file_name: Option<PathBuf>,
-    #[clap(index = 1, required = true, value_name = "FILENAME|DIRNAME")]
-    file: PathBuf,
+    file_name: Option<String>,
+    #[clap(index = 1, required = true, min_values = 1, value_name = "FILENAME|DIRNAME")]
+    files: Vec<PathBuf>,
 }
 
 // send, send-many, serve
@@ -83,9 +84,6 @@ struct CommonLeaderArgs {
 // receive
 #[derive(Debug, Args)]
 struct CommonReceiverArgs {
-    /// Rename the received file or folder, overriding the name suggested by the sender.
-    #[clap(long = "rename", visible_alias = "name", value_name = "FILE_NAME")]
-    file_name: Option<PathBuf>,
     /// Store transferred file or folder in the specified directory. Defaults to $PWD.
     #[clap(long = "out-dir", value_name = "PATH", default_value = ".")]
     file_path: PathBuf,
@@ -173,7 +171,6 @@ enum WormholeCommand {
         mut_arg("help", |a| a.help("Print this help message")),
     )]
     Send {
-        /// The file or directory to send
         #[clap(flatten)]
         common: CommonArgs,
         #[clap(flatten)]
@@ -283,28 +280,33 @@ async fn main() -> eyre::Result<()> {
         })
         .ok();
 
-    let concat_file_name = |file_path: &Path, file_name: Option<_>| {
-        // TODO this has gotten out of hand (it ugly)
-        // The correct solution would be to make `file_name` an Option everywhere and
-        // move the ".tar" part further down the line.
-        // The correct correct solution would be to have working file transfer instead
-        // of sending stupid archives.
-        file_name
-            .map(std::ffi::OsString::from)
-            .or_else(|| {
-                let mut name = file_path.file_name().map(std::ffi::OsString::from);
-                if file_path.is_dir() {
-                    name = name.map(|mut name| {
-                        name.push(".tar");
-                        name
-                    });
-                }
-                name
-            })
-            .ok_or_else(|| {
-                eyre::format_err!("You can't send a file without a name. Maybe try --rename")
-            })
-    };
+    async fn make_send_offer(mut files: Vec<PathBuf>, file_name: Option<String>) -> eyre::Result<transfer::OfferSend> {
+        // TODO
+        // eyre::ensure!(file_path.exists(), "{} does not exist", file_path.display());
+
+        match (files.len(), file_name) {
+            (0, _) => unreachable!("Already checked by CLI parser"),
+            (1, Some(file_name)) => {
+                let file = files.remove(0);
+                Ok(transfer::OfferSend::new_file_or_folder(file_name, file).await?)
+            },
+            (1, None) => {
+                let file = files.remove(0);
+                let file_name = file.file_name()
+                    .ok_or_else(|| eyre::format_err!("You can't send a file without a name. Maybe try --rename"))?
+                    .to_str()
+                    .ok_or_else(|| eyre::format_err!("File path must be a valid UTF-8 string"))?
+                    .to_owned();
+                Ok(transfer::OfferSend::new_file_or_folder(file_name, file).await?)
+            },
+            (_, Some(_)) => Err(
+                eyre::format_err!("Can't customize file name when sending multiple files")
+            ),
+            (_, None) => {
+                todo!()
+            }
+        }
+    }
 
     match app.command {
         WormholeCommand::Send {
@@ -313,13 +315,11 @@ async fn main() -> eyre::Result<()> {
             common_send:
                 CommonSenderArgs {
                     file_name,
-                    file: file_path,
+                    files,
                 },
             ..
         } => {
-            let file_name = concat_file_name(&file_path, file_name.as_ref())?;
-
-            eyre::ensure!(file_path.exists(), "{} does not exist", file_path.display());
+            let offer = make_send_offer(files, file_name).await?;
 
             let transit_abilities = parse_transit_args(&common);
             let (wormhole, _code, relay_server) = match util::cancellable(
@@ -344,8 +344,7 @@ async fn main() -> eyre::Result<()> {
             Box::pin(send(
                 wormhole,
                 relay_server,
-                file_path.as_ref(),
-                &file_name,
+                offer,
                 transit_abilities,
                 ctrl_c.clone(),
             ))
@@ -356,7 +355,7 @@ async fn main() -> eyre::Result<()> {
             timeout,
             common,
             common_leader: CommonLeaderArgs { code, code_length },
-            common_send: CommonSenderArgs { file_name, file },
+            common_send: CommonSenderArgs { file_name, files },
             ..
         } => {
             let transit_abilities = parse_transit_args(&common);
@@ -378,21 +377,21 @@ async fn main() -> eyre::Result<()> {
             };
             let timeout = Duration::from_secs(timeout * 60);
 
-            let file_name = concat_file_name(&file, file_name.as_ref())?;
+            let offer = make_send_offer(files, file_name).await?;
 
-            Box::pin(send_many(
-                relay_server,
-                &code,
-                file.as_ref(),
-                &file_name,
-                tries,
-                timeout,
-                wormhole,
-                &mut term,
-                transit_abilities,
-                ctrl_c,
-            ))
-            .await?;
+            // Box::pin(send_many(
+            //     relay_server,
+            //     &code,
+            //     offer,
+            //     tries,
+            //     timeout,
+            //     wormhole,
+            //     &mut term,
+            //     transit_abilities,
+            //     ctrl_c,
+            // ))
+            // .await?;
+            todo!()
         },
         WormholeCommand::Receive {
             noconfirm,
@@ -400,7 +399,6 @@ async fn main() -> eyre::Result<()> {
             common_follower: CommonFollowerArgs { code },
             common_receiver:
                 CommonReceiverArgs {
-                    file_name,
                     file_path,
                 },
             ..
@@ -427,7 +425,6 @@ async fn main() -> eyre::Result<()> {
                 wormhole,
                 relay_server,
                 file_path.as_os_str(),
-                file_name.map(std::ffi::OsString::from).as_deref(),
                 noconfirm,
                 transit_abilities,
                 ctrl_c,
@@ -741,19 +738,17 @@ fn server_print_code(
 async fn send(
     wormhole: Wormhole,
     relay_server: url::Url,
-    file_path: &std::ffi::OsStr,
-    file_name: &std::ffi::OsStr,
+    offer: transfer::OfferSend,
     transit_abilities: transit::Abilities,
     ctrl_c: impl Fn() -> futures::future::BoxFuture<'static, ()>,
 ) -> eyre::Result<()> {
     let pb = create_progress_bar(0);
     let pb2 = pb.clone();
-    transfer::send_file_or_folder(
+    transfer::send(
         wormhole,
         relay_server,
-        file_path,
-        file_name,
         transit_abilities,
+        offer,
         &transit::log_transit_connection,
         move |sent, total| {
             if sent == 0 {
@@ -771,141 +766,137 @@ async fn send(
     Ok(())
 }
 
-async fn send_many(
-    relay_server: url::Url,
-    code: &magic_wormhole::Code,
-    file_path: &std::ffi::OsStr,
-    file_name: &std::ffi::OsStr,
-    max_tries: u64,
-    timeout: Duration,
-    wormhole: Wormhole,
-    term: &mut Term,
-    transit_abilities: transit::Abilities,
-    ctrl_c: impl Fn() -> futures::future::BoxFuture<'static, ()>,
-) -> eyre::Result<()> {
-    log::warn!("Reminder that you are sending the file to multiple people, and this may reduce the overall security. See the help page for more information.");
+// async fn send_many(
+//     relay_server: url::Url,
+//     code: &magic_wormhole::Code,
+//     offer: transfer::OfferSend,
+//     max_tries: u64,
+//     timeout: Duration,
+//     wormhole: Wormhole,
+//     term: &mut Term,
+//     transit_abilities: transit::Abilities,
+//     ctrl_c: impl Fn() -> futures::future::BoxFuture<'static, ()>,
+// ) -> eyre::Result<()> {
+//     log::warn!("Reminder that you are sending the file to multiple people, and this may reduce the overall security. See the help page for more information.");
 
-    /* Progress bar is commented out for now. See the issues about threading/async in
-     * the Indicatif repository for more information. Multiple progress bars are not usable
-     * for us at the moment, so we'll have to do without for now.
-     */
-    let mp = MultiProgress::new();
+//     /* Progress bar is commented out for now. See the issues about threading/async in
+//      * the Indicatif repository for more information. Multiple progress bars are not usable
+//      * for us at the moment, so we'll have to do without for now.
+//      */
+//     let mp = MultiProgress::new();
 
-    let file_path = Arc::new(file_path.to_owned());
-    let file_name = Arc::new(file_name.to_owned());
-    // TODO go back to reference counting again
-    //let url = Arc::new(relay_server);
+//     let file_path = Arc::new(file_path.to_owned());
+//     let file_name = Arc::new(file_name.to_owned());
+//     // TODO go back to reference counting again
+//     //let url = Arc::new(relay_server);
 
-    let time = Instant::now();
+//     let time = Instant::now();
 
-    /* Special-case the first send with reusing the existing connection */
-    send_in_background(
-        relay_server.clone(),
-        Arc::clone(&file_path),
-        Arc::clone(&file_name),
-        wormhole,
-        term.clone(),
-        &mp,
-        transit_abilities,
-        ctrl_c(),
-    )
-    .await?;
+//     /* Special-case the first send with reusing the existing connection */
+//     send_in_background(
+//         relay_server.clone(),
+//         Arc::clone(&file_path),
+//         Arc::clone(&file_name),
+//         wormhole,
+//         term.clone(),
+//         &mp,
+//         transit_abilities,
+//         ctrl_c(),
+//     )
+//     .await?;
 
-    for tries in 0.. {
-        if time.elapsed() >= timeout {
-            log::info!(
-                "{:?} have elapsed, we won't accept any new connections now.",
-                timeout
-            );
-            break;
-        }
-        if tries > max_tries {
-            log::info!("Max number of tries reached, we won't accept any new connections now.");
-            break;
-        }
+//     for tries in 0.. {
+//         if time.elapsed() >= timeout {
+//             log::info!(
+//                 "{:?} have elapsed, we won't accept any new connections now.",
+//                 timeout
+//             );
+//             break;
+//         }
+//         if tries > max_tries {
+//             log::info!("Max number of tries reached, we won't accept any new connections now.");
+//             break;
+//         }
 
-        let (_server_welcome, wormhole) =
-            magic_wormhole::Wormhole::connect_with_code(transfer::APP_CONFIG, code.clone()).await?;
-        send_in_background(
-            relay_server.clone(),
-            Arc::clone(&file_path),
-            Arc::clone(&file_name),
-            wormhole,
-            term.clone(),
-            &mp,
-            transit_abilities,
-            ctrl_c(),
-        )
-        .await?;
-    }
+//         let (_server_welcome, wormhole) =
+//             magic_wormhole::Wormhole::connect_with_code(transfer::APP_CONFIG, code.clone()).await?;
+//         send_in_background(
+//             relay_server.clone(),
+//             Arc::clone(&file_path),
+//             Arc::clone(&file_name),
+//             wormhole,
+//             term.clone(),
+//             &mp,
+//             transit_abilities,
+//             ctrl_c(),
+//         )
+//         .await?;
+//     }
 
-    async fn send_in_background(
-        url: url::Url,
-        file_name: Arc<std::ffi::OsString>,
-        file_path: Arc<std::ffi::OsString>,
-        wormhole: Wormhole,
-        mut term: Term,
-        mp: &MultiProgress,
-        transit_abilities: transit::Abilities,
-        cancel: impl Future<Output = ()> + Send + 'static,
-    ) -> eyre::Result<()> {
-        writeln!(&mut term, "Sending file to peer").unwrap();
-        let pb = create_progress_bar(0);
-        let pb = mp.add(pb);
-        async_std::task::spawn(async move {
-            let pb2 = pb.clone();
-            let result = async move {
-                transfer::send_file_or_folder(
-                    wormhole,
-                    url,
-                    file_path.deref(),
-                    file_name.deref(),
-                    transit_abilities,
-                    &transit::log_transit_connection,
-                    move |sent, total| {
-                        if sent == 0 {
-                            pb2.reset_elapsed();
-                            pb2.set_length(total);
-                            pb2.enable_steady_tick(std::time::Duration::from_millis(250));
-                        }
-                        pb2.set_position(sent);
-                    },
-                    cancel,
-                )
-                .await?;
-                eyre::Result::<_>::Ok(())
-            };
-            match result.await {
-                Ok(_) => {
-                    pb.finish();
-                    log::info!("Successfully sent file to someone");
-                },
-                Err(e) => {
-                    pb.abandon();
-                    log::error!("Send failed, {}", e);
-                },
-            };
-        });
-        Ok(())
-    }
+//     async fn send_in_background(
+//         url: url::Url,
+//         offer: transfer::OfferSend,
+//         wormhole: Wormhole,
+//         mut term: Term,
+//         mp: &MultiProgress,
+//         transit_abilities: transit::Abilities,
+//         cancel: impl Future<Output = ()> + Send + 'static,
+//     ) -> eyre::Result<()> {
+//         writeln!(&mut term, "Sending file to peer").unwrap();
+//         let pb = create_progress_bar(0);
+//         let pb = mp.add(pb);
+//         async_std::task::spawn(async move {
+//             let pb2 = pb.clone();
+//             let result = async move {
+//                 transfer::send(
+//                     wormhole,
+//                     url,
+//                     transit_abilities,
+//                     offer,
+//                     &transit::log_transit_connection,
+//                     move |sent, total| {
+//                         if sent == 0 {
+//                             pb2.reset_elapsed();
+//                             pb2.set_length(total);
+//                             pb2.enable_steady_tick(std::time::Duration::from_millis(250));
+//                         }
+//                         pb2.set_position(sent);
+//                     },
+//                     cancel,
+//                 )
+//                 .await?;
+//                 eyre::Result::<_>::Ok(())
+//             };
+//             match result.await {
+//                 Ok(_) => {
+//                     pb.finish();
+//                     log::info!("Successfully sent file to someone");
+//                 },
+//                 Err(e) => {
+//                     pb.abandon();
+//                     log::error!("Send failed, {}", e);
+//                 },
+//             };
+//         });
+//         Ok(())
+//     }
 
-    Ok(())
-}
+//     Ok(())
+// }
 
 async fn receive(
     wormhole: Wormhole,
     relay_server: url::Url,
     target_dir: &std::ffi::OsStr,
-    file_name: Option<&std::ffi::OsStr>,
     noconfirm: bool,
     transit_abilities: transit::Abilities,
     ctrl_c: impl Fn() -> futures::future::BoxFuture<'static, ()>,
 ) -> eyre::Result<()> {
-    let req = transfer::request_file(wormhole, relay_server, transit_abilities, ctrl_c())
+    let req = transfer::request(wormhole, relay_server, transit_abilities, ctrl_c())
         .await
         .context("Could not get an offer")?;
     /* If None, the task got cancelled */
-    let req = match req {
+    let req: transfer::ReceiveRequest = match req {
         Some(req) => req,
         None => return Ok(()),
     };
